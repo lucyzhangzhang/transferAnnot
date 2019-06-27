@@ -121,7 +121,6 @@ if [[ "$splitted" != 1 ]]; then
     cd split
     cp $1 . 
     name="$(basename -- $1)"
-#    ~brian/bin/split -b -d '>' $name
     awk -v test="$name" -F_ '/^>/{close(file);file=$NF} /./{print > test"."file}' $name
     echo -e "split\t1" >> $LOG
     cd ..
