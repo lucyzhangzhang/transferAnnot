@@ -1,0 +1,225 @@
+#!/bin/bash
+
+REF=$1
+GTF=$2
+QUERY=$3
+DIR=$4
+
+cd $DIR
+
+#help message
+help_msg="Bash script for transferring GTF entries of reference genome to new assembly,
+thus producing a new GTF file for the new assembly.
+
+Utilizes nucmer from the Mummer toolset, GNU parallel (Perl), as well as non-POSIX seq.
+
+Usage:
+    $(basename "$0") <Reference.fasta> <Reference.gtf> <Assembly.fasta> <output_directory>
+    "
+
+#prints help if nothing is given or if too many files were given
+if [[ $# -eq 0 ]]; then
+    echo -e "No files given"
+    echo -e "$help_msg"
+    exit 0
+elif [[ $# -gt 4 ]]; then
+    echo -e "Too many arguments!"
+    echo -e "$help_msg"
+    exit 0
+fi
+
+#test if each file exists
+for file in "$@"; do
+    if [[ ! -e "$file" ]]; then
+        echo -e "$file doesn't exist!"
+        exit 1
+    fi
+done
+
+#test for overwrite
+while [[ -d "tmp" ]]; do
+    read -n1 -p "tmp directory exists, overwrite (y/n)? " ask
+    case $ask in
+        y|Y) 
+            echo -e "\nOverwriting tmp file"
+            rm -rf tmp
+            mkdir tmp
+            rm transferGTF.log
+            touch transferGTF.log
+            break
+            ;;
+        #continue from before
+        n|N) 
+            echo -e "\nContinuing from previous run..."
+            break
+            ;;
+        *) 
+            echo -e "\nPlease enter y/n: " 
+            ;;
+    esac
+done
+
+if [[ ! -e "tmp" ]]; then
+    mkdir tmp
+    touch transferGTF.log
+fi
+
+#Log file
+LOG=$DIR/transferGTF.log
+
+##get_genes.sh 
+function getGene () {
+    
+    gene=$1
+    start=$2
+    stop=$3
+    refscaff=split/trimmed/$8.$4
+
+    transcript=$5
+    type=$6
+    output=$7
+    
+    if [[ "$stop" -gt "$start" ]] ; then
+        let reverse=0
+        let "length=($stop - $start)"
+    else
+        let reverse=1
+#        echo "reverse is true"
+        let "length=($start - $stop)"
+    fi
+    if [[ "$reverse" -eq 0 ]] ; then
+        echo ">$gene:$4:$type:$start:$stop:$transcript" >> $output && \
+            awk -v b="$start" -v l="$length" '{print substr($1, b, l)}' "$refscaff" | \
+            sed -e 's/.\{100\}/&\n/g' >> $output
+    else
+        echo ">$gene:$4:$type:$start:$stop:$transcript" >> $output && \
+            awk -v b="$stop" -v l="$length" '{print substr($1, b, l)}' "$refscaff" | \
+            tr 'ATCG' 'TAGC' | rev | \
+            sed -e 's/.\{100\}/&\n/g' >> $output
+    fi
+}
+
+#export get_gene to use with parallel `sem`
+export -f getGene
+
+cd tmp
+#parse GTF file
+echo "Parsing GTF file..."
+gtfParse=`perl -ne '/GTF\s(\d)/ && print $1' $LOG`
+if [[ "$gtfParse" != 1 ]]; then
+    perl -ne '/(.*?)(\d+)\s(.+?)\s(.+?)\s(\d+)\s(\d+)\s(.+?)\s(.+?)\s(.+?)gene_id.+?"(.+?)".*?transcript_id.+?"(.*?)".*/ && print("$10\t$5\t$6\t$2\t$11\t$4\n")' $2 > parseGTF.tmp
+    echo -e "GTF\t1" >> $LOG
+else
+    echo "GTF already parsed"
+fi
+
+#splitting the reference multifasta with awk
+echo "Populating reference split folder..."
+splitted=`perl -ne '/split\s(\d)/ && print $1' $LOG`
+if [[ "$splitted" != 1 ]]; then
+    mkdir split
+    cd split
+    cp $1 . 
+    name="$(basename -- $1)"
+#    ~brian/bin/split -b -d '>' $name
+    awk -v test="$name" -F_ '/^>/{close(file);file=$NF} /./{print > test"."file}' $name
+    echo -e "split\t1" >> $LOG
+    cd ..
+else
+    echo "Files already split"
+    name="$(basename -- $1)"
+fi
+
+cd split
+#removing the newlines and '>' in split files for awk
+echo "Populating reference trimmed folder..."
+trim=`perl -ne '/trim\s(\d)/ && print $1' $LOG`
+
+if [[ "$trim" != 1 ]]; then
+    mkdir trimmed
+    #multicore
+    ls $name.* | parallel --bar -a - -j 10 "cat {} | sed '/>.*/d' | tr '\n' ' ' | sed 's/\s//g' > trimmed/{}"
+    echo -e "trim\t1" >> $LOG
+else
+    echo "Files already trimmed"
+fi
+# $DIR/tmp
+cd ..	
+
+#generate reference multi-fasta file for input into nucmer
+echo -e "\nGenerating reference multi-fasta..."
+
+#set up the query fasta
+if [[ -e "tmp_multi.fasta" ]]; then
+    rm tmp_multi.fasta
+    touch tmp_multi.fasta
+else
+    touch tmp_multi.fasta
+fi
+
+multi=`perl -ne '/multi\t(\d)/ && print $1' $LOG`
+if [[ "$multi" != 1 ]]; then
+    #run in backgroud but...
+    parallel --bar -j 10 -k --xapply -C '\t' --group getGene :::: $DIR/tmp/parseGTF.tmp ::: tmp_multi.fasta ::: $name 
+    perl -0777 -pe 's/>.*\n(?=.*>)//g' tmp_multi.fasta > multi.fasta 
+    echo -e "multi\t1" >> $LOG
+else
+    echo "Multi-fasta already generated"
+fi
+
+#wait for all parallel processes finish
+wait
+
+
+qbase=${QUERY##*/}
+qnoExt=${qbase%.*}
+#get basename of query with no extensions for nucmer output prefix
+nuc=`perl -ne '/nucmer\s(\d)/ && print $1' $LOG`
+
+if [[ "$nuc" != 1 ]]; then
+    echo -e "\nRunning nucmer..."
+    nucmer --maxmatch -o -c 50 -p $DIR/$qnoExt multi.fasta $QUERY
+    echo -e "nucmer\t1" >> $LOG
+else
+    echo "Nucmer already completed"
+fi
+
+#process nucmer file
+nucParse=`perl -ne '/nucmerParse\s(\d)/ && print $1' $LOG`
+function findKey () {
+
+    key=$1
+    ref=$2
+    out=$3
+
+    if grep -Fq $key $ref; then
+        :
+    else
+        echo $key >> $out
+    fi
+}
+
+export -f findKey
+
+if [[ "$nucParse" != 1 ]]; then
+    rm $DIR/$qnoExt.unmapped
+    echo -e "\nParsing nucmer coordinates file"
+    sed '1,5d' $DIR/$qnoExt.coords | sed 's/|//g' | awk '(NR>1) && ($7 > 85) && ($1 < 20)' > nucCoords
+    perl -ne '/\s+?\d+?\s+?\d+?\s+?(\d+?)\s+?(\d+?)\s+?\d+?\s+?(\d+?)\s+?\d+?\.\d+?\s+?(\w+?.+?):\d+:(.+?):\d+?:\d+?:(.+?)\s+?(.+$)/ && print("$7\ttransferGTF\t$5\t$1\t$2\t1000\tsd\t\.\tgene_id \"$4\"; transcript_id \"$6\";\n")' nucCoords > tmp.gtf
+    awk  'BEGIN {FS=OFS="\t"} {if ($4 > $5) {$7="+"} else {$7="-"}}1' tmp.gtf | awk -F'[\t"]' '{print $1"\t"$10"\t"$0}' | sort -k1 --version-sort -k2 | cut -f3- > $DIR/$qnoExt.gtf
+    echo "Calculating unmapped GTF entries..."
+    grep -Po '>\K.*' multi.fasta > fasta.names
+    parallel --bar -j 10 --xapply --group findKey :::: fasta.names ::: nucCoords ::: $DIR/$qnoExt.unmapped
+    wait
+    echo "Total unmapped GTF entries: "`wc -l < $DIR/$qnoExt.unmapped`
+    echo -e "nucmerParse\t1" >> $LOG
+else
+    echo "Nucmer coordinates already parsed"
+fi
+
+#echo -e "Cleaning up..."
+cd $DIR
+#rm -rf $DIR/tmp
+#rm $LOG
+
+echo "Completed"
